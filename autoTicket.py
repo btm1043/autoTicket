@@ -4,20 +4,20 @@ import json
 from pathlib import Path
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QUrl, QTimer, Qt
-from PyQt6.QtWidgets import (
+from PyQt5.QtCore import QUrl, QTimer, Qt
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QPushButton, QSplitter, QMessageBox
+    QLabel, QTextEdit, QPushButton, QSplitter, QMessageBox, QInputDialog
 )
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
 
 import extract_msg  # pip install extract-msg
 
 
-START_URL = "https://your-internal-servicenow-host/"
+START_URL = "https://127.0.0.1:8443"
 SN_HOST_REGEX = r"(service-now\.com|your-internal-servicenow-host)"
 REQUIRED_DOM_SELECTOR = "#incident\\.short_description, input[name='incident.short_description']"
+ALLOW_INSECURE_TLS_FOR_HOSTS = {"127.0.0.1", "localhost"}
 
 
 @dataclass
@@ -183,6 +183,68 @@ class DropLabel(QLabel):
                 return
 
 
+class BrowserPage(QWebEnginePage):
+    def __init__(self, profile, parent=None, log_fn=None, insecure_tls_hosts=None):
+        super().__init__(profile, parent)
+        self._log_fn = log_fn or (lambda _: None)
+        self._insecure_tls_hosts = {
+            str(h).strip().lower()
+            for h in (insecure_tls_hosts or [])
+            if str(h).strip()
+        }
+
+    def _safe_log(self, msg: str):
+        try:
+            self._log_fn(msg)
+        except Exception:
+            pass
+
+    def _error_details(self, cert_error):
+        host = ""
+        code = ""
+        desc = ""
+        overridable = False
+
+        try:
+            url = cert_error.url()
+            if url is not None:
+                host = url.host().lower()
+        except Exception:
+            pass
+
+        try:
+            code = str(cert_error.error())
+        except Exception:
+            code = ""
+
+        try:
+            desc = str(cert_error.errorDescription())
+        except Exception:
+            desc = ""
+
+        try:
+            overridable = bool(cert_error.isOverridable())
+        except Exception:
+            overridable = False
+
+        return host, code, desc, overridable
+
+    def certificateError(self, cert_error):
+        host, code, desc, overridable = self._error_details(cert_error)
+        if host in self._insecure_tls_hosts and overridable:
+            self._safe_log(
+                f"[tls][warn] ignoring certificate error for trusted local host '{host}' "
+                f"(code={code}, desc={desc})"
+            )
+            return True
+
+        self._safe_log(
+            f"[tls][error] certificate error blocked "
+            f"(host={host or 'unknown'}, code={code}, desc={desc}, overridable={overridable})"
+        )
+        return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -195,9 +257,23 @@ class MainWindow(QMainWindow):
         )
 
         self.view = QWebEngineView(self)
-        self.view.setPage(self.profile.createStandardPage())
+        self.profile = QWebEngineProfile("sn-profile", self)
+        self.profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.ForcePersistentCookies
+        )
+
+        self.page = BrowserPage(
+            self.profile,
+            self.view,
+            log_fn=self.log,
+            insecure_tls_hosts=ALLOW_INSECURE_TLS_FOR_HOSTS,
+        )
+        self.view.setPage(self.page)
         self.view.urlChanged.connect(self.on_url_changed)
         self.view.loadFinished.connect(self.on_load_finished)
+        self.client_cert_selection_supported = hasattr(self.page, "selectClientCertificate")
+        if self.client_cert_selection_supported:
+            self.page.selectClientCertificate.connect(self.on_select_client_certificate)
 
         self.drop_label = DropLabel(self)
 
@@ -256,10 +332,137 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(splitter)
 
+        if self.client_cert_selection_supported:
+            self.log("[tls] client certificate selection is enabled")
+        else:
+            self.log("[tls] client certificate selection signal not available in this QtWebEngine build")
+
         self.view.setUrl(QUrl(START_URL))
 
     def log(self, msg: str):
         self.log_output.append(msg)
+
+    @staticmethod
+    def _cert_value_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(v) for v in value if v)
+        return str(value)
+
+    def _cert_subject(self, cert, key: str) -> str:
+        try:
+            return self._cert_value_text(cert.subjectInfo(key)).strip()
+        except Exception:
+            return ""
+
+    def _cert_issuer(self, cert, key: str) -> str:
+        try:
+            return self._cert_value_text(cert.issuerInfo(key)).strip()
+        except Exception:
+            return ""
+
+    def _describe_cert(self, cert, index: int) -> str:
+        subject = self._cert_subject(cert, "CN") or self._cert_subject(cert, "O") or "(unknown subject)"
+        issuer = self._cert_issuer(cert, "CN") or self._cert_issuer(cert, "O") or "(unknown issuer)"
+
+        serial = ""
+        try:
+            serial = str(cert.serialNumber()).strip()
+        except Exception:
+            serial = ""
+
+        expires = ""
+        try:
+            expires = cert.expiryDate().toString(Qt.ISODate)
+        except Exception:
+            expires = ""
+
+        bits = [f"{index + 1}. {subject}", f"issuer={issuer}"]
+        if serial:
+            bits.append(f"serial={serial}")
+        if expires:
+            bits.append(f"expires={expires}")
+        return " | ".join(bits)
+
+    def on_select_client_certificate(self, selection):
+        try:
+            certs = list(selection.certificates())
+        except Exception as e:
+            self.log(f"[tls][error] could not read certificates: {e}")
+            try:
+                selection.selectNone()
+            except Exception:
+                pass
+            return
+
+        if not certs:
+            self.log("[tls] server requested a client certificate but none were available")
+            try:
+                selection.selectNone()
+            except Exception:
+                pass
+            return
+
+        host = ""
+        port = ""
+        try:
+            host = str(selection.host())
+        except Exception:
+            pass
+        try:
+            port = str(selection.port())
+        except Exception:
+            pass
+
+        item_to_cert = {}
+        items = []
+        for i, cert in enumerate(certs):
+            label = self._describe_cert(cert, i)
+            while label in item_to_cert:
+                label += " "
+            item_to_cert[label] = cert
+            items.append(label)
+
+        prompt = "Server requested an X.509 client certificate.\nSelect which certificate to use:"
+        if host or port:
+            prompt += f"\n\nTarget: {host}:{port}"
+
+        picked_label, ok = QInputDialog.getItem(
+            self,
+            "Select X.509 Certificate",
+            prompt,
+            items,
+            0,
+            False,
+        )
+
+        if not ok:
+            self.log("[tls] certificate selection canceled; no client certificate was sent")
+            try:
+                selection.selectNone()
+            except Exception:
+                pass
+            return
+
+        cert = item_to_cert.get(picked_label)
+        if cert is None:
+            self.log("[tls][error] certificate selection was invalid")
+            try:
+                selection.selectNone()
+            except Exception:
+                pass
+            return
+
+        try:
+            selection.select(cert)
+            self.log(f"[tls] selected client certificate: {picked_label}")
+        except Exception as e:
+            self.log(f"[tls][error] failed to apply certificate selection: {e}")
+            try:
+                selection.selectNone()
+            except Exception:
+                pass
 
     def on_url_changed(self, url: QUrl):
         self.drop_label.set_armed(False)

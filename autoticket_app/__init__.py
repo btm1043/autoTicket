@@ -1,0 +1,1 @@
+"""AutoTicket application package."""
